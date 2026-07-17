@@ -1,8 +1,6 @@
 import re
 from auth_test import get_gmail_service
 
-# Gmail search query — narrows down to likely job-application emails
-# before we spend LLM calls classifying them
 QUERY = (
     '(application OR applied OR "thank you for applying" OR interview '
     'OR "your application" OR recruiter OR "next steps" OR offer OR '
@@ -19,39 +17,51 @@ def extract_domain(sender):
     return match.group(1).lower() if match else "unknown"
 
 
-def fetch_candidate_emails(max_results=50):
+def fetch_candidate_emails(target_count=200):
+    """Pulls candidate emails using pagination until target_count raw
+    candidates are gathered (or Gmail runs out of matches)."""
     service = get_gmail_service()
 
-    results = service.users().messages().list(
-        userId="me", q=QUERY, maxResults=max_results
-    ).execute()
-
-    messages = results.get("messages", [])
-    print(f"Found {len(messages)} candidate emails.\n")
-
     email_data = []
+    page_token = None
 
-    for msg in messages:
-        msg_data = service.users().messages().get(
-            userId="me", id=msg["id"], format="metadata",
-            metadataHeaders=["Subject", "From", "Date"]
-        ).execute()
+    while len(email_data) < target_count:
+        request_args = {"userId": "me", "q": QUERY, "maxResults": 100}
+        if page_token:
+            request_args["pageToken"] = page_token
 
-        headers = msg_data["payload"]["headers"]
-        subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
-        sender = next((h["value"] for h in headers if h["name"] == "From"), "(unknown)")
-        date = next((h["value"] for h in headers if h["name"] == "Date"), "(unknown)")
+        results = service.users().messages().list(**request_args).execute()
+        messages = results.get("messages", [])
 
-        email_data.append({
-            "id": msg["id"],
-            "subject": subject,
-            "from": sender,
-            "date": date,
-            "domain": extract_domain(sender),
-        })
+        if not messages:
+            break
 
-        print(f"- {subject}  |  from: {sender}")
+        for msg in messages:
+            msg_data = service.users().messages().get(
+                userId="me", id=msg["id"], format="metadata",
+                metadataHeaders=["Subject", "From", "Date"]
+            ).execute()
 
+            headers = msg_data["payload"]["headers"]
+            subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
+            sender = next((h["value"] for h in headers if h["name"] == "From"), "(unknown)")
+            date = next((h["value"] for h in headers if h["name"] == "Date"), "(unknown)")
+
+            email_data.append({
+                "id": msg["id"],
+                "subject": subject,
+                "from": sender,
+                "date": date,
+                "domain": extract_domain(sender),
+            })
+
+        page_token = results.get("nextPageToken")
+        print(f"Fetched {len(email_data)} candidates so far...")
+
+        if not page_token:
+            break
+
+    print(f"\nFound {len(email_data)} total candidate emails.\n")
     return email_data
 
 

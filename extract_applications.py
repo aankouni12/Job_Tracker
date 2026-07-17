@@ -1,11 +1,16 @@
 import json
 import os
 import re
+import sys
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from openpyxl import Workbook
 from fetch_job_emails import fetch_candidate_emails
 from auth_test import get_gmail_service
+
+# Windows consoles default to cp1252, which can't encode the ✓/— characters
+# used in progress output below.
+sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv()
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -43,6 +48,7 @@ Respond ONLY with valid JSON, no markdown formatting, no code fences, no other t
   "is_job_related": true or false,
   "company": "company name or null",
   "role": "job title or null",
+  "job_id": "requisition/job ID number if mentioned (e.g. REQ2026070436, 26WD94900), otherwise null",
   "location": "city/state or 'Remote' or null if not mentioned",
   "status": "one of: applied, interview_invite, rejected, offer, follow_up, other",
   "date_applied": "the email date if this looks like the original application confirmation, otherwise null",
@@ -70,45 +76,67 @@ Respond ONLY with valid JSON, no markdown formatting, no code fences, no other t
         return None
 
 
-def find_location_with_search(company, role):
-    prompt = f"""Search the web to find the city/state (or "Remote") where this internship/job is based.
+def find_location_with_search(company, role, job_id=None):
+    def try_search(query_context):
+        prompt = f"""Find the SPECIFIC location where this exact job posting is based — NOT the company's headquarters and NOT a generic office location from a company-overview page (e.g. a Wikipedia infobox or LinkedIn's "headquarters" field). Job postings are often based in different cities than HQ, especially internships.
 
-Company: {company}
-Role: {role if role else "(unknown role)"}
+{query_context}
+
+Steps:
+1. Search the web for the actual job posting — prefer the company's own careers page, or LinkedIn/Indeed — searching by job ID/requisition number first if one is given, since that finds the exact posting instead of a generic company page.
+2. If you find a promising posting URL, fetch it with the web_fetch tool and read the location stated ON that specific posting page — that's the best source. If the fetch fails, is blocked, or the page doesn't clearly state a location, fall back to the location shown in the search results themselves (e.g. Indeed/LinkedIn listing snippets), as long as it looks specific to this posting rather than a generic company-overview page.
+3. Only return null if neither the fetched page nor the search results give any location information specific to this job — don't return null just because the fetch step itself failed.
+4. Prefer a specific city/office over the company's general headquarters whenever the two differ and you have a specific one available.
 
 Respond ONLY with valid JSON, no markdown, no other text:
-{{"location": "City, State" or "Remote" or null if you cannot determine it with reasonable confidence}}"""
+{{"location": "City, State" or "Remote" or null if you found no location information for this specific job at all}}"""
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=500,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": prompt}]
-    )
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            tools=[
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 2},
+                {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 2, "max_content_tokens": 3000},
+            ],
+            messages=[{"role": "user", "content": prompt}]
+        )
+        # With tools in play, Haiku often narrates ("I'll search for...",
+        # "Based on the page I fetched...") before or around the JSON answer
+        # instead of returning bare JSON, so pull the JSON object out of the
+        # response text with a regex instead of assuming the whole text is JSON.
+        text_parts = [block.text for block in response.content if block.type == "text"]
+        raw = "".join(text_parts)
+        matches = re.findall(r'\{[^{}]*"location"[^{}]*\}', raw, re.DOTALL)
+        if not matches:
+            return None
+        try:
+            return json.loads(matches[-1]).get("location")
+        except json.JSONDecodeError:
+            return None
 
-    text_parts = [block.text for block in response.content if block.type == "text"]
-    raw = "".join(text_parts).strip()
+    if job_id:
+        loc = try_search(f"Company: {company}\nRole: {role or '(unknown)'}\nJob ID/Requisition Number: {job_id}")
+        if loc:
+            return loc
 
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    try:
-        data = json.loads(raw)
-        return data.get("location")
-    except (json.JSONDecodeError, IndexError):
-        return None
+    loc = try_search(f"Company: {company}\nRole: {role or '(unknown)'}")
+    return loc
 
 
-PERSONAL_DOMAINS = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com"}
+def load_location_cache(filename="location_cache.json"):
+    if os.path.exists(filename):
+        with open(filename) as f:
+            return json.load(f)
+    return {}
 
-SHARED_ATS_DOMAINS = {
-    "myworkday.com", "greenhouse-mail.io", "hire.lever.co", "icims.com",
-    "talent.icims.com", "smartrecruiters.com", "wayup.com", "jobvite.com",
-    "linkedin.com", "ycombinator.com", "workatastartup.com"
-}
+
+def save_location_cache(cache, filename="location_cache.json"):
+    with open(filename, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def location_cache_key(company, role):
+    return f"{normalize_company(company)}|{normalize_company(role)}"
 
 
 def normalize_company(name):
@@ -118,46 +146,50 @@ def normalize_company(name):
 
 
 def find_matching_key(norm_name, existing_keys):
-    """Fuzzy-match a normalized company name against existing merge keys —
-    treats substring containment as a match (e.g. 'heard' vs 'heardsop')."""
-    if not norm_name:
+    """Fuzzy-match a normalized company name against existing merge keys.
+    A prefix match (e.g. 'magna' vs 'magnainternational') is treated as a
+    strong signal on its own, since it's how a short-form name relates to
+    a full legal name. A mid-string/suffix substring match is weaker, so
+    it additionally requires the shorter name to be at least 70% the
+    length of the longer one, to avoid false merges."""
+    if not norm_name or len(norm_name) < 4:
         return None
     for k in existing_keys:
         if k == norm_name:
             return k
-        if len(norm_name) >= 4 and len(k) >= 4 and (norm_name in k or k in norm_name):
+        shorter, longer = sorted([norm_name, k], key=len)
+        if len(shorter) < 4:
+            continue
+        if longer.startswith(shorter):
+            return k
+        if shorter in longer and len(shorter) / len(longer) >= 0.7:
             return k
     return None
 
 
 def dedupe_and_merge(records):
+    """Merge records primarily by normalized company name — this is the
+    most reliable signal since a company's name doesn't change across
+    different sending domains. Domain is only used as a last-resort key
+    when no company name was extracted at all."""
     status_rank = {"applied": 0, "follow_up": 1, "interview_invite": 2,
                    "offer": 3, "rejected": 3, "other": 0}
 
-    merged = {}       # key -> record
-    company_keys = {}  # normalized company name -> key actually used in merged
+    merged = {}
+    keys_in_order = []
 
     for r in records:
-        domain = r.get("domain") or ""
         norm_company = normalize_company(r.get("company"))
 
-        if domain in PERSONAL_DOMAINS or domain in SHARED_ATS_DOMAINS:
-            # Shared/untrustworthy domain — match on normalized company name instead
-            existing_key = find_matching_key(norm_company, company_keys.keys())
-            if existing_key:
-                key = company_keys[existing_key]
-            elif norm_company:
-                key = norm_company
-                company_keys[norm_company] = key
-            else:
-                key = f"unmatched-{id(r)}"
+        if norm_company:
+            existing_key = find_matching_key(norm_company, keys_in_order)
+            key = existing_key if existing_key else norm_company
         else:
-            key = domain
-            if norm_company:
-                company_keys[norm_company] = key
+            key = f"nodomain-{r.get('domain') or 'unknown'}"
 
         if key not in merged:
             merged[key] = r
+            keys_in_order.append(key)
         else:
             existing = merged[key]
             if status_rank.get(r["status"], 0) >= status_rank.get(existing["status"], 0):
@@ -165,7 +197,7 @@ def dedupe_and_merge(records):
                 existing["notes"] = r.get("notes") or existing.get("notes")
             if r.get("date_applied") and not existing.get("date_applied"):
                 existing["date_applied"] = r["date_applied"]
-            for field in ["location", "role"]:
+            for field in ["location", "role", "job_id"]:
                 if not existing.get(field) and r.get(field):
                     existing[field] = r[field]
             if r.get("company") and len(r["company"]) > len(existing.get("company") or ""):
@@ -202,12 +234,16 @@ def write_to_excel(records, filename="applications.xlsx"):
 
 def run_extraction():
     service = get_gmail_service()
-    emails = fetch_candidate_emails(max_results=50)
+    emails = fetch_candidate_emails(target_count=200)
 
     results = []
     for email in emails:
         email["snippet"] = get_email_body(service, email["id"])
-        extracted = extract_with_claude(email)
+        try:
+            extracted = extract_with_claude(email)
+        except Exception as e:
+            print(f"  ! Classification failed for '{email['subject']}' ({type(e).__name__}: {e}) — skipping, will retry next run")
+            continue
 
         if extracted and extracted.get("is_job_related"):
             extracted["subject"] = email["subject"]
@@ -216,21 +252,65 @@ def run_extraction():
             results.append(extracted)
             print(f"✓ {extracted['company']} — {extracted['role']} ({extracted['status']})")
 
+            # Incremental save so a mid-run credit/rate-limit/network failure
+            # doesn't throw away everything classified so far.
+            partial = [r for r in results if r.get("company") or r.get("role")]
+            with open("applications.json", "w") as f:
+                json.dump(dedupe_and_merge(partial), f, indent=2)
+
     results = [r for r in results if r.get("company") or r.get("role")]
 
     merged = dedupe_and_merge(results)
 
-    # Fill in missing locations via web search
-    for r in merged:
-        if not r.get("location") and r.get("company"):
-            print(f"Searching for location: {r['company']} — {r.get('role')}")
-            loc = find_location_with_search(r["company"], r.get("role"))
-            if loc:
-                r["location"] = loc
-                print(f"  → {loc}")
-
+    # Save immediately after dedup so a crash during location search never
+    # loses the extraction pass itself.
     with open("applications.json", "w") as f:
         json.dump(merged, f, indent=2)
+
+    location_cache = load_location_cache()
+    # Only worth spending search credits on applications still active enough
+    # to matter — skip rejected/follow-up/etc.
+    SEARCH_ELIGIBLE_STATUSES = {"applied", "interview_invite"}
+    # Hard cap on live API searches per run to keep credit spend predictable.
+    # Cache hits don't count against this — only actual API calls do.
+    MAX_LOCATION_SEARCHES = 20
+    status_priority = {"interview_invite": 0, "applied": 1}
+
+    eligible = [
+        r for r in merged
+        if not r.get("location") and r.get("company")
+        and r.get("status") in SEARCH_ELIGIBLE_STATUSES
+    ]
+    eligible.sort(key=lambda r: status_priority.get(r.get("status"), 99))
+
+    searches_used = 0
+    for r in eligible:
+        cache_key = location_cache_key(r["company"], r.get("role"))
+        if cache_key in location_cache:
+            r["location"] = location_cache[cache_key]
+            print(f"  (cached) {r['company']} — {r.get('role')} → {r['location']}")
+        else:
+            if searches_used >= MAX_LOCATION_SEARCHES:
+                print(f"  (cap reached, {MAX_LOCATION_SEARCHES} searches used) skipping {r['company']} — {r.get('role')}")
+                continue
+
+            print(f"Searching for location: {r['company']} — {r.get('role')}")
+            searches_used += 1
+            try:
+                loc = find_location_with_search(r["company"], r.get("role"), r.get("job_id"))
+            except Exception as e:
+                print(f"  ! Location search failed for {r['company']} ({type(e).__name__}: {e}) — skipping, will retry next run")
+                loc = None
+
+            if loc:
+                r["location"] = loc
+                location_cache[cache_key] = loc
+                save_location_cache(location_cache)
+                print(f"  → {loc}")
+
+        # Incremental save so progress survives a crash/interrupt mid-loop.
+        with open("applications.json", "w") as f:
+            json.dump(merged, f, indent=2)
 
     write_to_excel(merged)
 

@@ -4,28 +4,33 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# Read-only scope — we only need to read emails, not send/modify
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# readonly — for scanning the inbox; send — for emailing the spreadsheet out
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 
 
 def get_gmail_service():
     creds = None
 
-    # token.json stores your access/refresh tokens after the first login
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
 
-    # If there are no valid credentials, log in via browser
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    scopes_ok = creds and set(SCOPES).issubset(set(creds.scopes or []))
+
+    if not creds or not creds.valid or not scopes_ok:
+        if creds and creds.expired and creds.refresh_token and scopes_ok:
             creds.refresh(Request())
         else:
+            # Either no token yet, or the saved token doesn't cover a scope
+            # we now need (e.g. it predates the send permission) — get fresh
+            # consent covering everything in SCOPES.
             flow = InstalledAppFlow.from_client_secrets_file(
                 "credentials.json", SCOPES
             )
             creds = flow.run_local_server(port=0)
 
-        # Save the credentials for next time
         with open("token.json", "w") as token:
             token.write(creds.to_json())
 
