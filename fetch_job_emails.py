@@ -17,10 +17,13 @@ def extract_domain(sender):
     return match.group(1).lower() if match else "unknown"
 
 
-def fetch_candidate_emails(target_count=200):
+def fetch_candidate_emails(target_count=200, service=None):
     """Pulls candidate emails using pagination until target_count raw
-    candidates are gathered (or Gmail runs out of matches)."""
-    service = get_gmail_service()
+    candidates are gathered (or Gmail runs out of matches). Pass an
+    explicit `service` to scan someone else's inbox (e.g. a web visitor's
+    own OAuth grant) instead of the shared token.json account."""
+    if service is None:
+        service = get_gmail_service()
 
     email_data = []
     page_token = None
