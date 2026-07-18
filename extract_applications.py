@@ -50,7 +50,7 @@ Respond ONLY with valid JSON, no markdown formatting, no code fences, no other t
   "role": "job title or null",
   "job_id": "requisition/job ID number if mentioned (e.g. REQ2026070436, 26WD94900), otherwise null",
   "location": "city/state or 'Remote' or null if not mentioned",
-  "status": "one of: applied, interview_invite, rejected, offer, follow_up, other",
+  "status": "one of: applied, interview_invite, rejected, offer — pick whichever is the most advanced stage implied by this email (e.g. a note about scheduling a call is interview_invite, a generic status-check reply about a still-pending application is applied)",
   "date_applied": "the email date if this looks like the original application confirmation, otherwise null",
   "notes": "brief one-line note, or null"
 }}"""
@@ -172,8 +172,7 @@ def dedupe_and_merge(records):
     most reliable signal since a company's name doesn't change across
     different sending domains. Domain is only used as a last-resort key
     when no company name was extracted at all."""
-    status_rank = {"applied": 0, "follow_up": 1, "interview_invite": 2,
-                   "offer": 3, "rejected": 3, "other": 0}
+    status_rank = {"applied": 0, "interview_invite": 1, "offer": 2, "rejected": 2}
 
     merged = {}
     keys_in_order = []
@@ -232,9 +231,31 @@ def write_to_excel(records, filename="applications.xlsx"):
     wb.save(filename)
 
 
-def run_extraction():
-    service = get_gmail_service()
-    emails = fetch_candidate_emails(target_count=200)
+def run_extraction_core(
+    service,
+    target_email_count=200,
+    max_location_searches=20,
+    applications_json_path="applications.json",
+    applications_xlsx_path="applications.xlsx",
+    location_cache_path="location_cache.json",
+    progress_cb=None,
+):
+    """Runs the full pipeline (fetch -> classify -> dedupe -> geolocate ->
+    write) against whichever Gmail service is passed in. Shared by the
+    developer's own CLI run (own account, own files) and the web app's
+    per-visitor runs (their account, temp files) — only the scope/paths
+    differ between callers. Returns the deduplicated records list.
+
+    location_cache_path defaults to the same shared file for every caller,
+    since company+role -> location is public job-posting info, not personal
+    data, so different users' runs get to reuse each other's lookups."""
+
+    def progress(msg):
+        print(msg)
+        if progress_cb:
+            progress_cb(msg)
+
+    emails = fetch_candidate_emails(target_count=target_email_count, service=service)
 
     results = []
     for email in emails:
@@ -242,7 +263,7 @@ def run_extraction():
         try:
             extracted = extract_with_claude(email)
         except Exception as e:
-            print(f"  ! Classification failed for '{email['subject']}' ({type(e).__name__}: {e}) — skipping, will retry next run")
+            progress(f"  ! Classification failed for '{email['subject']}' ({type(e).__name__}: {e}) — skipping, will retry next run")
             continue
 
         if extracted and extracted.get("is_job_related"):
@@ -250,13 +271,14 @@ def run_extraction():
             extracted["date"] = email["date"]
             extracted["domain"] = email["domain"]
             results.append(extracted)
-            print(f"✓ {extracted['company']} — {extracted['role']} ({extracted['status']})")
+            progress(f"✓ {extracted['company']} — {extracted['role']} ({extracted['status']})")
 
             # Incremental save so a mid-run credit/rate-limit/network failure
             # doesn't throw away everything classified so far.
-            partial = [r for r in results if r.get("company") or r.get("role")]
-            with open("applications.json", "w") as f:
-                json.dump(dedupe_and_merge(partial), f, indent=2)
+            if applications_json_path:
+                partial = [r for r in results if r.get("company") or r.get("role")]
+                with open(applications_json_path, "w") as f:
+                    json.dump(dedupe_and_merge(partial), f, indent=2)
 
     results = [r for r in results if r.get("company") or r.get("role")]
 
@@ -264,17 +286,15 @@ def run_extraction():
 
     # Save immediately after dedup so a crash during location search never
     # loses the extraction pass itself.
-    with open("applications.json", "w") as f:
-        json.dump(merged, f, indent=2)
+    if applications_json_path:
+        with open(applications_json_path, "w") as f:
+            json.dump(merged, f, indent=2)
 
-    location_cache = load_location_cache()
+    location_cache = load_location_cache(location_cache_path)
     # Only worth spending search credits on applications still active enough
     # to matter — skip rejected/follow-up/etc.
-    SEARCH_ELIGIBLE_STATUSES = {"applied", "interview_invite"}
-    # Hard cap on live API searches per run to keep credit spend predictable.
-    # Cache hits don't count against this — only actual API calls do.
-    MAX_LOCATION_SEARCHES = 20
-    status_priority = {"interview_invite": 0, "applied": 1}
+    SEARCH_ELIGIBLE_STATUSES = {"applied", "interview_invite", "offer"}
+    status_priority = {"offer": 0, "interview_invite": 1, "applied": 2}
 
     eligible = [
         r for r in merged
@@ -288,33 +308,41 @@ def run_extraction():
         cache_key = location_cache_key(r["company"], r.get("role"))
         if cache_key in location_cache:
             r["location"] = location_cache[cache_key]
-            print(f"  (cached) {r['company']} — {r.get('role')} → {r['location']}")
+            progress(f"  (cached) {r['company']} — {r.get('role')} → {r['location']}")
         else:
-            if searches_used >= MAX_LOCATION_SEARCHES:
-                print(f"  (cap reached, {MAX_LOCATION_SEARCHES} searches used) skipping {r['company']} — {r.get('role')}")
+            if searches_used >= max_location_searches:
+                progress(f"  (cap reached, {max_location_searches} searches used) skipping {r['company']} — {r.get('role')}")
                 continue
 
-            print(f"Searching for location: {r['company']} — {r.get('role')}")
+            progress(f"Searching for location: {r['company']} — {r.get('role')}")
             searches_used += 1
             try:
                 loc = find_location_with_search(r["company"], r.get("role"), r.get("job_id"))
             except Exception as e:
-                print(f"  ! Location search failed for {r['company']} ({type(e).__name__}: {e}) — skipping, will retry next run")
+                progress(f"  ! Location search failed for {r['company']} ({type(e).__name__}: {e}) — skipping, will retry next run")
                 loc = None
 
             if loc:
                 r["location"] = loc
                 location_cache[cache_key] = loc
-                save_location_cache(location_cache)
-                print(f"  → {loc}")
+                save_location_cache(location_cache, location_cache_path)
+                progress(f"  → {loc}")
 
         # Incremental save so progress survives a crash/interrupt mid-loop.
-        with open("applications.json", "w") as f:
-            json.dump(merged, f, indent=2)
+        if applications_json_path:
+            with open(applications_json_path, "w") as f:
+                json.dump(merged, f, indent=2)
 
-    write_to_excel(merged)
+    if applications_xlsx_path:
+        write_to_excel(merged, applications_xlsx_path)
 
-    print(f"\nExtracted {len(results)} raw records, merged to {len(merged)} unique applications")
+    progress(f"\nExtracted {len(results)} raw records, merged to {len(merged)} unique applications")
+    return merged
+
+
+def run_extraction():
+    service = get_gmail_service()
+    run_extraction_core(service, target_email_count=200, max_location_searches=20)
     print("→ applications.json and applications.xlsx")
 
 
