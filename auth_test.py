@@ -11,6 +11,16 @@ SCOPES = [
 ]
 
 
+def build_service_from_credentials(creds_info):
+    """Builds a Gmail service for one visitor's own OAuth grant (the web
+    sign-in flow), as opposed to get_gmail_service() below which is the
+    single shared token.json used by the developer's own CLI scripts."""
+    creds = Credentials(**creds_info)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return build("gmail", "v1", credentials=creds)
+
+
 def get_gmail_service():
     creds = None
 
