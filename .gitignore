@@ -3,3 +3,8 @@ token.json
 .env
 __pycache__/
 venv/
+applications.json
+applications.xlsx
+location_cache.json
+*.bak
+.claude/
