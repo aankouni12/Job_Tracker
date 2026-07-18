@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Job Application Tracker</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f4f5f7;
+      color: #1a1a1a;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #17181c; color: #e8e8ea; }
+      .card { background: #212227 !important; border-color: #33343a !important; }
+    }
+    .card {
+      width: 100%;
+      max-width: 780px;
+      background: #fff;
+      border: 1px solid #e3e4e8;
+      border-radius: 18px;
+      padding: 60px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    h1 { font-size: 2rem; margin: 0 0 12px; }
+    p.sub { margin: 0 0 28px; font-size: 1.1rem; opacity: 0.7; line-height: 1.55; }
+    .spinner {
+      width: 22px;
+      height: 22px;
+      border: 3px solid #d6d8dd;
+      border-top-color: #2563eb;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 16px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #status-text {
+      font-size: 0.85rem;
+      line-height: 1.5;
+      word-break: break-word;
+      min-height: 40px;
+    }
+    .msg {
+      margin-top: 16px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      line-height: 1.4;
+    }
+    .msg.error { background: #fee2e2; color: #7f1d1d; }
+    .msg.success { background: #dcfce7; color: #14532d; }
+    @media (prefers-color-scheme: dark) {
+      .msg.error { background: #3a1a1a; color: #fca5a5; }
+      .msg.success { background: #14351f; color: #86efac; }
+    }
+    a.button {
+      display: block;
+      text-align: center;
+      margin-top: 16px;
+      padding: 12px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #fff;
+      background: #2563eb;
+      border-radius: 8px;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Building your spreadsheet{% if email %} for {{ email }}{% endif %}</h1>
+    <p class="sub">This can take a minute or two — scanning your inbox, classifying emails, and looking up a few job locations.</p>
+    <div class="spinner" id="spinner"></div>
+    <div id="status-text">Starting…</div>
+    <div id="result"></div>
+  </div>
+
+  <script>
+    const jobId = {{ job_id | tojson }};
+    const statusText = document.getElementById("status-text");
+    const spinner = document.getElementById("spinner");
+    const result = document.getElementById("result");
+
+    async function poll() {
+      try {
+        const res = await fetch(`/status/${jobId}`);
+        const data = await res.json();
+
+        if (data.status === "running") {
+          // textContent, not innerHTML — data.message can contain text pulled
+          // from the user's own email content (company/role names), which
+          // must never be interpreted as HTML/script.
+          statusText.textContent = data.message || "Working…";
+          setTimeout(poll, 1500);
+        } else if (data.status === "done") {
+          spinner.style.display = "none";
+          statusText.textContent = data.message || "Done.";
+          result.replaceChildren(); // clear
+          const link = document.createElement("a");
+          link.className = "button";
+          link.href = "/download/" + encodeURIComponent(jobId);
+          link.textContent = "Download your spreadsheet";
+          result.appendChild(link);
+          window.location = "/download/" + encodeURIComponent(jobId);
+        } else {
+          spinner.style.display = "none";
+          result.replaceChildren(); // clear
+          const div = document.createElement("div");
+          div.className = "msg error";
+          div.textContent = data.error || data.message || "Something went wrong.";
+          result.appendChild(div);
+        }
+      } catch (e) {
+        setTimeout(poll, 2000);
+      }
+    }
+
+    poll();
+  </script>
+</body>
+</html>
